@@ -1,25 +1,31 @@
-use diesel::prelude::*;
-use diesel::r2d2::{self, ConnectionManager};
+use diesel_async::AsyncPgConnection;
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use diesel_async::pooled_connection::bb8::Pool;
+
 use dotenvy::dotenv;
 use std::env;
-use std::time::Duration;
 
-pub type DbPool = r2d2::Pool<ConnectionManager<PgConnection>>;
+pub type DbPool = Pool<AsyncPgConnection>;
 
-pub fn establish_connection_pool() -> DbPool {
+pub async fn establish_connection_pool() -> DbPool {
     dotenv().ok();
 
     let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    let manager = ConnectionManager::<PgConnection>::new(database_url);
+    establish_async_pool(&database_url).await
+}
 
-    r2d2::Pool::builder()
-        .max_size(100)
-        .min_idle(Some(20))
-        .connection_timeout(Duration::from_secs(5))
-        .idle_timeout(Some(Duration::from_secs(300)))
-        .max_lifetime(Some(Duration::from_secs(1800)))
-        .build(manager)
-        .expect("Failed to create pool")
+async fn establish_async_pool(database_url: &str) -> DbPool {
+    // Manager for AsyncPgConnection (postgres)
+    let config = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
+
+    // bb8 pool
+    Pool::builder()
+        .max_size(128)
+        .min_idle(16)
+        .connection_timeout(std::time::Duration::from_secs(5))
+        .build(config)
+        .await
+        .expect("Failed to create async pool")
 }
 
 pub mod models;

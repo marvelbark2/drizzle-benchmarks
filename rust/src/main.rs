@@ -2,16 +2,13 @@ use axum::{
     Json, Router,
     extract::{Query, State},
     http::StatusCode,
-    response::IntoResponse,
     routing::get,
 };
 use parking_lot::Mutex;
 use rust::{DbPool, establish_connection_pool, models::*, queries::*};
 use serde::Deserialize;
-use socket2::{Domain, Socket, Type};
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 use sysinfo::System;
-use tokio::net::TcpListener;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -38,265 +35,326 @@ struct SearchParam {
     term: String,
 }
 
-async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let needs_warmup = {
-        let mut warmed = state.cpu_warmed_up.lock();
-        if !*warmed {
-            *warmed = true;
-            true
-        } else {
-            false
+async fn stats_handler(State(state): State<Arc<AppState>>) -> Result<Json<Vec<i32>>, StatusCode> {
+    let state = state.clone();
+
+    let res = tokio::task::spawn_blocking(move || {
+        let needs_warmup = {
+            let mut warmed = state.cpu_warmed_up.lock();
+            if !*warmed {
+                *warmed = true;
+                true
+            } else {
+                false
+            }
+        };
+
+        if needs_warmup {
+            {
+                let mut sys = state.sys.lock();
+                sys.refresh_cpu_all();
+            }
+            std::thread::sleep(Duration::from_millis(200));
         }
-    };
 
-    if needs_warmup {
-        {
-            let mut sys = state.sys.lock();
-            sys.refresh_cpu_all();
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+        let mut sys = state.sys.lock();
+        sys.refresh_cpu_all();
 
-    let mut sys = state.sys.lock();
-    sys.refresh_cpu_all();
+        sys.cpus()
+            .iter()
+            .map(|cpu| cpu.cpu_usage().round() as i32)
+            .collect()
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let result: Vec<i32> = sys
-        .cpus()
-        .iter()
-        .map(|cpu| cpu.cpu_usage().round() as i32)
-        .collect();
-
-    Json(result)
+    Ok(Json(res))
 }
 
 async fn get_customers(
     State(state): State<Arc<AppState>>,
     Query(params): Query<LimitOffset>,
 ) -> Result<Json<Vec<Customer>>, StatusCode> {
-    let mut conn = state
-        .pool
-        .get()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let limit = params.limit.unwrap_or(100);
     let offset = params.offset.unwrap_or(0);
-    p1(&mut conn, limit, offset)
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+
+    let result = {
+        let mut conn = state
+            .pool
+            .get()
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        p1(&mut conn, limit, offset)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    };
+
+    Ok(Json(result))
 }
 
 async fn get_customer_by_id(
     State(state): State<Arc<AppState>>,
     Query(params): Query<IdParam>,
 ) -> Result<Json<Option<Customer>>, StatusCode> {
-    let pool = state.pool.clone();
     let id = params.id;
 
-    tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let result = {
+        let mut conn = state
+            .pool
+            .get()
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
         p2(&mut conn, id)
-            .map(Json)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    };
+
+    Ok(Json(result))
 }
 
 async fn search_customer(
     State(state): State<Arc<AppState>>,
     Query(params): Query<SearchParam>,
 ) -> Result<Json<Vec<CustomerSearchResult>>, StatusCode> {
-    let pool = state.pool.clone();
     let term = params.term;
 
-    tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let result = {
+        let mut conn = state
+            .pool
+            .get()
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
         p3(&mut conn, &term)
-            .map(Json)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    };
+
+    Ok(Json(result))
 }
 
 async fn get_employees(
     State(state): State<Arc<AppState>>,
     Query(params): Query<LimitOffset>,
 ) -> Result<Json<Vec<Employee>>, StatusCode> {
-    let pool = state.pool.clone();
     let limit = params.limit.unwrap_or(100);
     let offset = params.offset.unwrap_or(0);
 
-    tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let result = {
+        let mut conn = state
+            .pool
+            .get()
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
         p4(&mut conn, limit, offset)
-            .map(Json)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    };
+
+    Ok(Json(result))
 }
 
 async fn get_employee_with_recipient(
     State(state): State<Arc<AppState>>,
     Query(params): Query<IdParam>,
-) -> Result<Json<Vec<EmployeeWithRecipient>>, StatusCode> {
-    let pool = state.pool.clone();
+) -> Result<Json<Option<EmployeeWithRecipient>>, StatusCode> {
     let id = params.id;
 
-    tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        p5(&mut conn, id).map(Json).map_err(|e| {
+    let result = {
+        let mut conn = state
+            .pool
+            .get()
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        p5(&mut conn, id).await.map_err(|e| {
             eprintln!("Error in p5: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR
-        })
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        })?
+    };
+
+    Ok(Json(result))
 }
 
 async fn get_suppliers(
     State(state): State<Arc<AppState>>,
     Query(params): Query<LimitOffset>,
 ) -> Result<Json<Vec<Supplier>>, StatusCode> {
-    let pool = state.pool.clone();
     let limit = params.limit.unwrap_or(100);
     let offset = params.offset.unwrap_or(0);
 
-    tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let result = {
+        let mut conn = state
+            .pool
+            .get()
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
         p6(&mut conn, limit, offset)
-            .map(Json)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    };
+
+    Ok(Json(result))
 }
 
 async fn get_supplier_by_id(
     State(state): State<Arc<AppState>>,
     Query(params): Query<IdParam>,
 ) -> Result<Json<Option<Supplier>>, StatusCode> {
-    let pool = state.pool.clone();
     let id = params.id;
 
-    tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let result = {
+        let mut conn = state
+            .pool
+            .get()
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
         p7(&mut conn, id)
-            .map(Json)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    };
+
+    Ok(Json(result))
 }
 
 async fn get_products(
     State(state): State<Arc<AppState>>,
     Query(params): Query<LimitOffset>,
 ) -> Result<Json<Vec<Product>>, StatusCode> {
-    let pool = state.pool.clone();
     let limit = params.limit.unwrap_or(100);
     let offset = params.offset.unwrap_or(0);
 
-    tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let result = {
+        let mut conn = state
+            .pool
+            .get()
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
         p8(&mut conn, limit, offset)
-            .map(Json)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    };
+
+    Ok(Json(result))
 }
 
 async fn get_product_with_supplier(
     State(state): State<Arc<AppState>>,
     Query(params): Query<IdParam>,
-) -> Result<Json<Vec<ProductWithSupplier>>, StatusCode> {
-    let pool = state.pool.clone();
+) -> Result<Json<Option<ProductWithSupplier>>, StatusCode> {
     let id = params.id;
 
-    tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let result = {
+        let mut conn = state
+            .pool
+            .get()
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
         p9(&mut conn, id)
-            .map(Json)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    };
+
+    Ok(Json(result))
 }
 
 async fn search_product(
     State(state): State<Arc<AppState>>,
     Query(params): Query<SearchParam>,
 ) -> Result<Json<Vec<ProductSearchResult>>, StatusCode> {
-    let pool = state.pool.clone();
     let term = params.term;
 
-    tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let result = {
+        let mut conn = state
+            .pool
+            .get()
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
         p10(&mut conn, &term)
-            .map(Json)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    };
+
+    Ok(Json(result))
 }
 
 async fn get_orders_with_details(
     State(state): State<Arc<AppState>>,
     Query(params): Query<LimitOffset>,
 ) -> Result<Json<Vec<P11Row>>, StatusCode> {
-    let pool = state.pool.clone();
     let limit = params.limit.unwrap_or(100);
     let offset = params.offset.unwrap_or(0);
 
-    tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let result = {
+        let mut conn = state
+            .pool
+            .get()
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
         p11(&mut conn, limit, offset)
-            .map(Json)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    };
+
+    Ok(Json(result))
 }
 
 async fn get_order_with_details(
     State(state): State<Arc<AppState>>,
     Query(params): Query<IdParam>,
-) -> Result<Json<Vec<P11Row>>, StatusCode> {
-    let pool = state.pool.clone();
+) -> Result<Json<Option<P11Row>>, StatusCode> {
     let id = params.id;
 
-    tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let result = {
+        let mut conn = state
+            .pool
+            .get()
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
         p12(&mut conn, id)
-            .map(Json)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    };
+
+    Ok(Json(result))
 }
 
 async fn get_order_with_details_and_products(
     State(state): State<Arc<AppState>>,
     Query(params): Query<IdParam>,
-) -> Result<Json<Vec<OrderWithDetailsAndProducts>>, StatusCode> {
-    let pool = state.pool.clone();
+) -> Result<Json<Option<OrderWithDetailsAndProducts>>, StatusCode> {
     let id = params.id;
 
-    tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let result = {
+        let mut conn = state
+            .pool
+            .get()
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
         p13(&mut conn, id)
-            .map(Json)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    };
+
+    Ok(Json(result))
 }
 
 #[tokio::main]
 async fn main() {
+    let pool = establish_connection_pool().await;
     let state = Arc::new(AppState {
-        pool: establish_connection_pool(),
+        pool,
         sys: Mutex::new(System::new_all()),
         cpu_warmed_up: Mutex::new(false),
     });
@@ -321,21 +379,18 @@ async fn main() {
         )
         .with_state(state);
 
-    // Create socket with optimizations for better performance
-    let addr: SocketAddr = "0.0.0.0:3003".parse().unwrap();
-    let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
-    socket.set_reuse_address(true).unwrap();
-    socket.set_nodelay(true).unwrap();
-    socket.bind(&addr.into()).unwrap();
-    socket.listen(8192).unwrap();
-    socket.set_nonblocking(true).unwrap();
-    
-    let listener = TcpListener::from_std(socket.into()).unwrap();
+    let listener = match tokio::net::TcpListener::bind(format!("0.0.0.0:{}", 3003)).await {
+        Ok(listener) => listener,
+        Err(err) => {
+            eprintln!("Failed to bind to port {}: {:?}", 3003, err);
+            return;
+        }
+    };
 
-    println!("Server running on http://0.0.0.0:3003");
+    println!("Starting server on port {}", 3003);
 
-    axum::serve(listener, app)
-        .tcp_nodelay(true)
-        .await
-        .unwrap();
+    // Start the server.
+    if let Err(err) = axum::serve(listener, app).await {
+        eprintln!("Failed to start server: {:?}", err);
+    }
 }

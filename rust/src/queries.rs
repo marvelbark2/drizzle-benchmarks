@@ -3,6 +3,7 @@ use diesel::{
     prelude::*,
     sql_types::{Double, Text},
 };
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use serde::Serialize;
 
 use crate::models::{Customer, Employee, Product, Supplier};
@@ -20,8 +21,11 @@ pub struct P11Row {
     pub total_price: Option<f64>,
 }
 
-pub fn p11(conn: &mut PgConnection, limit_: i64, offset_: i64) -> QueryResult<Vec<P11Row>> {
-    // LEFT JOIN => nullable()
+pub async fn p11(
+    conn: &mut AsyncPgConnection,
+    limit_: i64,
+    offset_: i64,
+) -> QueryResult<Vec<P11Row>> {
     let qty_f64 = order_details::quantity
         .nullable()
         .cast::<diesel::sql_types::Nullable<Double>>();
@@ -47,22 +51,29 @@ pub fn p11(conn: &mut PgConnection, limit_: i64, offset_: i64) -> QueryResult<Ve
         .limit(limit_)
         .offset(offset_)
         .load(conn)
+        .await
 }
 
 // p1: Get customers with limit/offset, ordered by id asc
-pub fn p1(conn: &mut PgConnection, limit_: i64, offset_: i64) -> QueryResult<Vec<Customer>> {
+pub async fn p1(
+    conn: &mut AsyncPgConnection,
+    limit_: i64,
+    offset_: i64,
+) -> QueryResult<Vec<Customer>> {
     customers::table
         .order_by(customers::id.asc())
         .limit(limit_)
         .offset(offset_)
         .load(conn)
+        .await
 }
 
 // p2: Find first customer by id
-pub fn p2(conn: &mut PgConnection, id_: i32) -> QueryResult<Option<Customer>> {
+pub async fn p2(conn: &mut AsyncPgConnection, id_: i32) -> QueryResult<Option<Customer>> {
     customers::table
         .filter(customers::id.eq(id_))
         .first(conn)
+        .await
         .optional()
 }
 
@@ -83,21 +94,30 @@ pub struct CustomerSearchResult {
     pub fax: Option<String>,
 }
 
-pub fn p3(conn: &mut PgConnection, term: &str) -> QueryResult<Vec<CustomerSearchResult>> {
+pub async fn p3(
+    conn: &mut AsyncPgConnection,
+    term: &str,
+) -> QueryResult<Vec<CustomerSearchResult>> {
     diesel::sql_query(
         "SELECT * FROM customers WHERE to_tsvector('english', company_name) @@ to_tsquery('english', $1)"
     )
     .bind::<Text, _>(term)
     .load(conn)
+    .await
 }
 
 // p4: Get employees with limit/offset, ordered by id asc
-pub fn p4(conn: &mut PgConnection, limit_: i64, offset_: i64) -> QueryResult<Vec<Employee>> {
+pub async fn p4(
+    conn: &mut AsyncPgConnection,
+    limit_: i64,
+    offset_: i64,
+) -> QueryResult<Vec<Employee>> {
     employees::table
         .order_by(employees::id.asc())
         .limit(limit_)
         .offset(offset_)
         .load(conn)
+        .await
 }
 
 // p5: Get employee with recipient (self-join), filtered by id
@@ -136,8 +156,10 @@ pub struct EmployeeWithRecipient {
     pub recipient_recipient_id: Option<i32>,
 }
 
-pub fn p5(conn: &mut PgConnection, id_: i32) -> QueryResult<Vec<EmployeeWithRecipient>> {
-    // Alias for the recipient (self-join)
+pub async fn p5(
+    conn: &mut AsyncPgConnection,
+    id_: i32,
+) -> QueryResult<Option<EmployeeWithRecipient>> {
     let recipient = diesel::alias!(employees as recipient);
 
     employees::table
@@ -177,33 +199,46 @@ pub fn p5(conn: &mut PgConnection, id_: i32) -> QueryResult<Vec<EmployeeWithReci
             recipient.field(employees::notes).nullable(),
             recipient.field(employees::recipient_id).nullable(),
         ))
-        .load(conn)
+        .first(conn)
+        .await
+        .optional()
 }
 
 // p6: Get suppliers with limit/offset, ordered by id asc
-pub fn p6(conn: &mut PgConnection, limit_: i64, offset_: i64) -> QueryResult<Vec<Supplier>> {
+pub async fn p6(
+    conn: &mut AsyncPgConnection,
+    limit_: i64,
+    offset_: i64,
+) -> QueryResult<Vec<Supplier>> {
     suppliers::table
         .order_by(suppliers::id.asc())
         .limit(limit_)
         .offset(offset_)
         .load(conn)
+        .await
 }
 
 // p7: Find first supplier by id
-pub fn p7(conn: &mut PgConnection, id_: i32) -> QueryResult<Option<Supplier>> {
+pub async fn p7(conn: &mut AsyncPgConnection, id_: i32) -> QueryResult<Option<Supplier>> {
     suppliers::table
         .filter(suppliers::id.eq(id_))
         .first(conn)
+        .await
         .optional()
 }
 
 // p8: Get products with limit/offset, ordered by id asc
-pub fn p8(conn: &mut PgConnection, limit_: i64, offset_: i64) -> QueryResult<Vec<Product>> {
+pub async fn p8(
+    conn: &mut AsyncPgConnection,
+    limit_: i64,
+    offset_: i64,
+) -> QueryResult<Vec<Product>> {
     products::table
         .order_by(products::id.asc())
         .limit(limit_)
         .offset(offset_)
         .load(conn)
+        .await
 }
 
 // p9: Get product with supplier (join), filtered by id
@@ -231,7 +266,10 @@ pub struct ProductWithSupplier {
     pub supplier_phone: String,
 }
 
-pub fn p9(conn: &mut PgConnection, id_: i32) -> QueryResult<Vec<ProductWithSupplier>> {
+pub async fn p9(
+    conn: &mut AsyncPgConnection,
+    id_: i32,
+) -> QueryResult<Option<ProductWithSupplier>> {
     products::table
         .inner_join(suppliers::table)
         .filter(products::id.eq(id_))
@@ -256,7 +294,9 @@ pub fn p9(conn: &mut PgConnection, id_: i32) -> QueryResult<Vec<ProductWithSuppl
             suppliers::country,
             suppliers::phone,
         ))
-        .load(conn)
+        .first(conn)
+        .await
+        .optional()
 }
 
 // p10: Full-text search on products.name
@@ -274,16 +314,20 @@ pub struct ProductSearchResult {
     pub supplier_id: i32,
 }
 
-pub fn p10(conn: &mut PgConnection, term: &str) -> QueryResult<Vec<ProductSearchResult>> {
+pub async fn p10(
+    conn: &mut AsyncPgConnection,
+    term: &str,
+) -> QueryResult<Vec<ProductSearchResult>> {
     diesel::sql_query(
         "SELECT * FROM products WHERE to_tsvector('english', name) @@ to_tsquery('english', $1)",
     )
     .bind::<Text, _>(term)
     .load(conn)
+    .await
 }
 
 // p12: Get single order with details by id
-pub fn p12(conn: &mut PgConnection, id_: i32) -> QueryResult<Vec<P11Row>> {
+pub async fn p12(conn: &mut AsyncPgConnection, id_: i32) -> QueryResult<Option<P11Row>> {
     let qty_f64 = order_details::quantity
         .nullable()
         .cast::<diesel::sql_types::Nullable<Double>>();
@@ -306,7 +350,9 @@ pub fn p12(conn: &mut PgConnection, id_: i32) -> QueryResult<Vec<P11Row>> {
             sum(order_details::quantity.nullable()),
             total_price_expr,
         ))
-        .load(conn)
+        .first(conn)
+        .await
+        .optional()
 }
 
 // p13: Get order with details and products by id
@@ -348,13 +394,23 @@ pub struct OrderWithDetailsAndProducts {
     pub details: Vec<OrderDetail>,
 }
 
-pub fn p13(conn: &mut PgConnection, id_: i32) -> QueryResult<Vec<OrderWithDetailsAndProducts>> {
+pub async fn p13(
+    conn: &mut AsyncPgConnection,
+    id_: i32,
+) -> QueryResult<Option<OrderWithDetailsAndProducts>> {
     use crate::models::Order;
 
-    // First get the order
-    let order: Order = orders::table.filter(orders::id.eq(id_)).first(conn)?;
+    let order: Option<Order> = orders::table
+        .filter(orders::id.eq(id_))
+        .first(conn)
+        .await
+        .optional()?;
 
-    // Then get order details with products
+    let order = match order {
+        Some(o) => o,
+        None => return Ok(None),
+    };
+
     let details: Vec<OrderDetail> = order_details::table
         .inner_join(products::table)
         .filter(order_details::order_id.eq(id_))
@@ -375,9 +431,10 @@ pub fn p13(conn: &mut PgConnection, id_: i32) -> QueryResult<Vec<OrderWithDetail
             products::discontinued,
             products::supplier_id,
         ))
-        .load(conn)?;
+        .load(conn)
+        .await?;
 
-    Ok(vec![OrderWithDetailsAndProducts {
+    Ok(Some(OrderWithDetailsAndProducts {
         id: order.id,
         order_date: order.order_date,
         required_date: order.required_date,
@@ -392,5 +449,5 @@ pub fn p13(conn: &mut PgConnection, id_: i32) -> QueryResult<Vec<OrderWithDetail
         customer_id: order.customer_id,
         employee_id: order.employee_id,
         details,
-    }])
+    }))
 }
